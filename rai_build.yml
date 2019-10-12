@@ -18,6 +18,6 @@ commands:
     - /usr/bin/time python m1.1.py # execute code
     - /usr/bin/time python m1.2.py # execute code
     - /usr/bin/time python m2.1.py # execute code
-    - /usr/bin/time python m3.1.py # execute code
-    - /usr/bin/time python m4.1.py # execute code
-    - /usr/bin/time python final.py # execute code
+      #- /usr/bin/time python m3.1.py # execute code
+      #- /usr/bin/time python m4.1.py # execute code
+      #- /usr/bin/time python final.py # execute code
