@@ -1,5 +1,6 @@
 #ifndef MXNET_OPERATOR_NEW_FORWARD_CUH_
 #define MXNET_OPERATOR_NEW_FORWARD_CUH_
+
 #define TILE_WIDTH 16
 
 #include <mxnet/base.h>
@@ -9,13 +10,14 @@ namespace mxnet
 namespace op
 {
 
-__global__ void forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
+
+__global__ void forward_kernel(float *y, const float *x, const float *k, const int B, 
+                                const int M, const int C, const int H, const int W, const int K)
 {
 
   // An example use of these macros:
   // float a = y4d(0,0,0,0)
   // y4d(0,0,0,0) = a
-
 
     /*
     Modify this function to implement the forward pass described in Chapter 16.
@@ -23,6 +25,13 @@ __global__ void forward_kernel(float *y, const float *x, const float *k, const i
     The goal here is to be correct AND fast.
     We have some nice #defs for you below to simplify indexing. Feel free to use them, or create your own.
     */
+
+    //OPTIMIZATION: shared memory convolution
+    //BTW the reasoning behind this is in chapter 16 pg 15 of the book :D
+    int X_TILE_WIDTH = TILE_WIDTH + (k - 1);
+    __shared__ float x_shared[X_TILE_WIDTH][X_TILE_WIDTH];
+    //TODO: move this to const memory to satisfy another optimization!
+    __shared__ float k_shared[k][k];
 
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
@@ -41,20 +50,21 @@ __global__ void forward_kernel(float *y, const float *x, const float *k, const i
     int c, p, q;
     if (h < H_out && w < W_out) {
 
-    float value = 0;
-    for(c = 0; c < C; c++){
-      for(p = 0; p < K; p++){
-        for(q = 0; q < K; q++){
-          value += x4d(n,c,h+p,w+q) * k4d(m,c,p,q);
+        float value = 0;
+        // loop thru input feature maps
+        for(c = 0; c < C; c++){
 
+            //loop thru convolution matrix elements
+            //p, q are indexes of the convolution matrix
+            for(p = 0; p < K; p++){
+                for(q = 0; q < K; q++){
+                    value += x4d(n,c,h+p,w+q) * k4d(m,c,p,q);
 
+                }
+            }
         }
-      }
-    }
     y4d(n,m,h,w) = value;
    }
-
-
 
 
 #undef y4d
@@ -72,17 +82,14 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
 {
 
     // Use mxnet's CHECK_EQ to do assertions.
-    // Remove this assertion when you do your implementation!
 
     // Extract the tensor dimensions into B,M,C,H,W,K
-    // ...
-
-    const int B = x.shape_[0];
-    const int M = y.shape_[1];
-    const int C = x.shape_[1];
-    const int H = x.shape_[2];
-    const int W = x.shape_[3];
-    const int K = w.shape_[3];
+    const int B = x.shape_[0]; //Number of elements in batch
+    const int M = y.shape_[1]; //Number of output feature maps
+    const int C = x.shape_[1]; //Number of input feature maps
+    const int H = x.shape_[2]; //Number of output elements (height)
+    const int W = x.shape_[3]; //Number of output elemetns (width)
+    const int K = w.shape_[3]; //Size of convolution matrix (K x K)
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
 
@@ -91,6 +98,9 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     const int Z = H_grid * W_grid;
     // Set the kernel dimensions
     dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
+    // x -> number of samples in batch
+    // y -> number of vertical tiles per output map
+    // z -> where output tile is inside of the output map
     dim3 gridDim(B,M,Z);
 
     // Call the kernel
