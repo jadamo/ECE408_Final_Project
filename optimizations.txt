@@ -1,0 +1,28 @@
+DESCRIPTION OF OPTIMIZATIONS
+
+(I felt bad about not being able to help write the report, so I wrote an outline for you guys. Hopefully this helps!) -Joe
+
+OPTIMIZATION 1: Shared memory convolution.
+
+Due to the exclusive use of global memory, the basic convolution kernel is extremely limited by the memory bandwidth. This is a lot slower than the peak performance speeds of GPUs, so a good place to start when it comes to optimizations is to reduce global memory reads. For this optimization we achieve this by placing x and k into each blocks shared memory. We allocate a block of size (TILE_WIDTH + K - 1) * (TILE_WIDTH + K - 1) of memory for x and a block of size K * K for k. For each imput feature map c, we then use the 1st K * K threads of a given block to load in k, then had all threads load in x. Once k and x are loaded into shared memory, we do the standard convolution where each thread within the acceptable domain preforms K * K operations before moving onto the next input feature map c and repeating the process of loading and calculating. <INSERT MEMORY BANDWIDTH ANALYSIS HERE>
+<insert impact on performance>
+
+NOTES: This is gonna run faster if TILE_WIDTH is bigger so when you do testing make it as big as you can. Also most likely should add analysis on memory reduction + how performance improves / gets worsse with certain values in the above description
+
+OPTIMIZATION 2: Unrolling + Matrix Multiplication
+
+We also set out to try to fundamentally alter the method of forward-propagation calculation and see if it had any impact on performance. As described in Chapter 16 of the book, it's possible to unroll the inputs k and x into large matrices to that the convolution step becomes a simple matrix multiplication. We unrolled k from a 4D M * C * K * K tensor to a 2D M * (C*K*K) matrix. This only had to be done once due to k being the same for all batch elements. For x, we iterated over batch elements B on the cpu and for each element b, unrolled it form a 3D array of size H * C * W to a 2D array of size ((W-K+1)*(H-K+1)) * (C*K*K), after which we preformed a shared-memory matrix multiplication in a seperate kernel. 
+We iterated over b sequantially due to the fact that unrolling x duplicated a lot of elements, and for large x inputs unrolling the entire 4D tensor might cause x_unrolled to be prohibitebly large for our memory. Thus we expect this method to not work as effectively when B is large as that will require more kernel calls. Despite this, switching to this method might prove highly beneficial, as even if the base unroll + matrix multiply method is comparable in speed to convolution, there are many known ways to improve upon the matrix multiplication kernel to speed it up further
+<insert impact on performance>
+
+NOTES: Make sure this is run WITHOUT register tiling in the matrix multiplication for the performance part because that's separate!
+
+OPTIMIZATION 3: ???
+
+The final optimization we tried is <whatever you guys end up doing for this>
+<insert impact on performance> - probably want to compare with both basic convolution AND unroll + shared-mem matrix multiply
+
+NOTES: 
+ - so apparently shared mem != register tiled uuhhhhhh if you guys dont have this a quick thing you could replace this with is probably put k in constant memory. (You could do it after you unroll k it should honestly be like 3 lines) I'd suggest one person does this and one makes the report
+ - You're gonna want to run each of these thru NVProf with the same initial data conditions. There should be a line in the yml file with nvprof set up to run. If I were you guys I would also run with a few data sizes (maybe one small one medium and one large) to give a solid picture on how performance is impacted
+ - They're giving out extra credit for being insightful I think so that's a good motivator I guess.
