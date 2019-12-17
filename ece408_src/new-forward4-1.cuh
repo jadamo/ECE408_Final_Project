@@ -41,8 +41,6 @@ int H_grid = ceil(H_out * 1.0/ TILE_WIDTH);
     //(void)W_out; // silence declared but never referenced warning. remove this line when you start working
 
 
-
-
  int n, m, h0, w0, h_base, w_base, h, w;
  //int X_tile_width = TILE_WIDTH + K-1;
  extern __shared__ float shmem[];
@@ -73,8 +71,6 @@ int H_grid = ceil(H_out * 1.0/ TILE_WIDTH);
       }
 
     }
-
-  __syncthreads();
 
 
  // load tile from X[n, c,…] into shared memory

@@ -11,18 +11,6 @@ namespace mxnet
 namespace op
 {
 
-
-// Calls unroll kernel from the host
-// void unroll_x(float* x_unroll, int total, float* x, int C, int H, int W, int K, int b){
-//     // H, C, W -> H, (C x W)
-//     int H_out = H - K + 1;
-//     int W_out = W - K + 1;
-//
-//     dim3 gridDim(ceil(C * H_out * W_out*1.0 / TILE_WIDTH), 1, 1);
-//     dim3 blockDim(TILE_WIDTH, 1, 1);
-//     unroll_x_kernel<<<gridDim, blockDim>>>(C, H, W, K, b, x, x_unroll);
-// }
-
 //All these parameters are needed for the #define macro :(
 __global__ void unroll_x_kernel(int C, int H, int W, int K, float* x_unroll, int total, float *X){
 
@@ -34,17 +22,21 @@ __global__ void unroll_x_kernel(int C, int H, int W, int K, float* x_unroll, int
     int W_out = W - K + 1;
     int W_unroll = H_out * W_out;
 
-    c = tx / W_unroll;  //row
-    s = tx % W_unroll;  //col
+    int stride = blockDim.x * gridDim.x;
+    while (tx < total){
+        c = tx / W_unroll;  //row
+        s = tx % W_unroll;  //col
 
-    int i = c % K;
-    c /= K; //come back to this
-    int j = c % K;
-    int k = c / K;
-    int col_out = s % W_out;
-    int col_out2 = s/W_out;
+        int i = c % K;
+        c /= K; //come back to this
+        int j = c % K;
+        int k = c / K;
+        int col_out = s % W_out;
+        int col_out2 = s/W_out;
 
-    x_unroll[tx] = X[k*H*W + (col_out2 + j) * W + (col_out + i)];
+        x_unroll[tx] = X[k*H*W + (col_out2 + j) * W + (col_out + i)];
+        tx+= stride;
+    }
 
 }
 
@@ -60,16 +52,20 @@ __global__ void matrix_multiply(float *x, float *w, float *y, int W_unroll, int 
 
     for(int i = 0; i < ceil(1.0*W_unroll/TILE_WIDTH); i++){
         int col_idx = i*TILE_WIDTH + threadIdx.x;
-        tile1[threadIdx.y][threadIdx.x] = 0;
-        tile2[threadIdx.y][threadIdx.x] = 0;
 
         if(col_idx < W_unroll){
             tile1[threadIdx.y][threadIdx.x] = x[row*W_unroll+col_idx];
         }
+        else{
+            tile1[threadIdx.y][threadIdx.x] = 0.0;
+        }
         int row_idx = i*TILE_WIDTH+threadIdx.y;
 
         if(row_idx < W_unroll){
-         tile2[threadIdx.y][threadIdx.x] = w[row_idx*H_unroll + col];
+            tile2[threadIdx.y][threadIdx.x] = w[row_idx*H_unroll + col];
+        }
+        else{
+            tile2[threadIdx.y][threadIdx.x] = 0.0;
         }
         __syncthreads();
         for(int j = 0; j < TILE_WIDTH; j++){

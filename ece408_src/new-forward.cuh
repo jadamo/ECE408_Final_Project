@@ -1,9 +1,9 @@
 #ifndef MXNET_OPERATOR_NEW_FORWARD_CUH_
 #define MXNET_OPERATOR_NEW_FORWARD_CUH_
 
-#define TILE_WIDTH 16
+#define TILE_WIDTH 32
 #define BLOCK_SIZE 1024
-#define KERN_SIZE 15000
+#define KERN_SIZE 16000 //Max is 64 KB
 
 #include <mxnet/base.h>
 
@@ -35,23 +35,26 @@ __global__ void unroll_x_kernel(int C, int H, int W, int K, float* x_unroll, int
     int W_out = W - K + 1;
     int W_unroll = H_out * W_out;
 
-    c = tx / W_unroll;  //row
-    s = tx % W_unroll;  //col
+    int stride = blockDim.x * gridDim.x;
+    while (tx < total){
+        c = tx / W_unroll;  //row
+        s = tx % W_unroll;  //col
 
-    int i = c % K;
-    c /= K; //come back to this
-    int j = c % K;
-    int k = c / K;
-    int col_out = s % W_out;
-    int col_out2 = s/W_out;
+        int i = c % K;
+        c /= K; //come back to this
+        int j = c % K;
+        int k = c / K;
+        int col_out = s % W_out;
+        int col_out2 = s/W_out;
 
-    x_unroll[tx] = X[k*H*W + (col_out2 + j) * W + (col_out + i)];
-
+        x_unroll[tx] = X[k*H*W + (col_out2 + j) * W + (col_out + i)];
+        tx+= stride;
+    }
 }
 
 __constant__ float Const_Kernel[KERN_SIZE];
 
-__global__ void matrix_multiply(float *x, float *w, float *y, int W_unroll, int M, int H_unroll){
+__global__ void matrix_multiply(float *w, float *x, float *y, int W_unroll, int M, int H_unroll){
 
     __shared__ float tile2[TILE_WIDTH][TILE_WIDTH];
 
@@ -66,11 +69,11 @@ __global__ void matrix_multiply(float *x, float *w, float *y, int W_unroll, int 
         int row_idx = i*TILE_WIDTH+threadIdx.y;
 
         if(row_idx < W_unroll){
-         tile2[threadIdx.y][threadIdx.x] = w[row_idx*H_unroll + col];
+         tile2[threadIdx.x][threadIdx.y] = x[row_idx*H_unroll + col];
         }
         __syncthreads();
         for(int j = 0; j < TILE_WIDTH; j++){
-                Y_val += Const_Kernel[row*W_unroll + i*TILE_WIDTH+j] * tile2[j][threadIdx.x];
+                Y_val += Const_Kernel[row*W_unroll + i*TILE_WIDTH+j] * tile2[threadIdx.x][j];
         }
         __syncthreads();
     }
@@ -110,11 +113,12 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y,
     const int W_unroll = C * K * K;
     const int H_unroll = H_out * W_out;
 
-
     float* x_unrolled;
     // float* w_unrolled;
 
-    cudaMemcpyToSymbol(Const_Kernel, w.dptr_, M*W_unroll*sizeof(float));
+    float* w_host = (float*)malloc(M*W_unroll*sizeof(float));
+    cudaMemcpy(w_host, w.dptr_, M*W_unroll*sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpyToSymbol(Const_Kernel, w_host, M*W_unroll*sizeof(float));
 
     int dimension = C*H*W;
     int total = W_unroll*H_unroll;
@@ -135,6 +139,7 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y,
 
     //free allocated memory
     cudaFree(x_unrolled);
+    free(w_host);
 
     // Use MSHADOW_CUDA_CALL to check for CUDA runtime errors.
     MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
