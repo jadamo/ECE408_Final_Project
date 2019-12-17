@@ -3,7 +3,6 @@
 
 #define TILE_WIDTH 16
 #define BLOCK_SIZE 1024
-#define KERN_SIZE 15000
 
 #include <mxnet/base.h>
 
@@ -49,10 +48,9 @@ __global__ void unroll_x_kernel(int C, int H, int W, int K, float* x_unroll, int
 
 }
 
-__constant__ float Const_Kernel[KERN_SIZE];
-
 __global__ void matrix_multiply(float *x, float *w, float *y, int W_unroll, int M, int H_unroll){
 
+    __shared__ float tile1[TILE_WIDTH][TILE_WIDTH];
     __shared__ float tile2[TILE_WIDTH][TILE_WIDTH];
 
     int row = blockIdx.y*blockDim.y+threadIdx.y;
@@ -61,8 +59,13 @@ __global__ void matrix_multiply(float *x, float *w, float *y, int W_unroll, int 
     float Y_val = 0;
 
     for(int i = 0; i < ceil(1.0*W_unroll/TILE_WIDTH); i++){
+        int col_idx = i*TILE_WIDTH + threadIdx.x;
+        tile1[threadIdx.y][threadIdx.x] = 0;
         tile2[threadIdx.y][threadIdx.x] = 0;
 
+        if(col_idx < W_unroll){
+            tile1[threadIdx.y][threadIdx.x] = x[row*W_unroll+col_idx];
+        }
         int row_idx = i*TILE_WIDTH+threadIdx.y;
 
         if(row_idx < W_unroll){
@@ -70,14 +73,16 @@ __global__ void matrix_multiply(float *x, float *w, float *y, int W_unroll, int 
         }
         __syncthreads();
         for(int j = 0; j < TILE_WIDTH; j++){
-                Y_val += Const_Kernel[row*W_unroll + i*TILE_WIDTH+j] * tile2[j][threadIdx.x];
+            Y_val += tile1[threadIdx.y][j] * tile2[j][threadIdx.x];
         }
         __syncthreads();
     }
 
-    if(row < M && col < H_unroll){
+    if(row < M && col < H_unroll)
+      for(int i = 0; i < W_unroll; i++){
           y[row*H_unroll+col] = Y_val;
-     }
+      }
+
 }
 
 
@@ -113,8 +118,6 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y,
 
     float* x_unrolled;
     // float* w_unrolled;
-
-    cudaMemcpyToSymbol(Const_Kernel, w.dptr_, M*W_unroll*sizeof(float));
 
     int dimension = C*H*W;
     int total = W_unroll*H_unroll;
