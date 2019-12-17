@@ -3,7 +3,7 @@
 
 #define TILE_WIDTH 16
 #define BLOCK_SIZE 1024
-#define KERNEL_SIZE 15000
+#define KERN_SIZE 15000
 
 #include <mxnet/base.h>
 
@@ -49,7 +49,7 @@ __global__ void unroll_x_kernel(int C, int H, int W, int K, float* x_unroll, int
 
 }
 
-__constant__ float Kernel[KERNEL_SIZE];
+__constant__ float Const_Kernel[KERN_SIZE];
 
 __global__ void matrix_multiply(float *x, float *w, float *y, int W_unroll, int M, int H_unroll){
 
@@ -70,7 +70,7 @@ __global__ void matrix_multiply(float *x, float *w, float *y, int W_unroll, int 
         }
         __syncthreads();
         for(int j = 0; j < TILE_WIDTH; j++){
-                Y_val += Kernel[row*W_unroll + i*TILE_WIDTH+j] * tile2[j][threadIdx.x
+                Y_val += Const_Kernel[row*W_unroll + i*TILE_WIDTH+j] * tile2[j][threadIdx.x];
         }
         __syncthreads();
     }
@@ -114,7 +114,7 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y,
     float* x_unrolled;
     // float* w_unrolled;
 
-    cudaMemcpyToSymbol(Kernel, w.dptr_, M*W_unroll*sizeof(float));
+    cudaMemcpyToSymbol(Const_Kernel, w.dptr_, M*W_unroll*sizeof(float));
 
     int dimension = C*H*W;
     int total = W_unroll*H_unroll;
