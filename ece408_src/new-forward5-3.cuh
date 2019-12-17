@@ -24,29 +24,7 @@ namespace op
 // }
 
 //All these parameters are needed for the #define macro :(
-__global__ void unroll_x_kernel(int C, int H, int W, int K, float* x_unroll, int total, float *X){
 
-
-    int c, s;
-    int tx = blockIdx.x*blockDim.x + threadIdx.x;
-
-    int H_out = H - K + 1;
-    int W_out = W - K + 1;
-    int W_unroll = H_out * W_out;
-
-    c = tx / W_unroll;  //row
-    s = tx % W_unroll;  //_idx
-
-    int i = c % K;
-    c /= K; //come back to this
-    int j = c % K;
-    int k = c / K;
-    int col_out = s % W_out;
-    int col_out2 = s/W_out;
-
-    x_unroll[tx] = X[k*H*W + (col_out2 + j) * W + (col_out + i)];
-
-}
 
 __global__ void matrix_multiply(float *x, float *w, float *y, int M, int C, int H, int W, int K) {
 
