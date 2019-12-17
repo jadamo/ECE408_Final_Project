@@ -1,9 +1,9 @@
 #ifndef MXNET_OPERATOR_NEW_FORWARD_CUH_
 #define MXNET_OPERATOR_NEW_FORWARD_CUH_
 
-#define TILE_WIDTH 32
-#define BLOCK_SIZE 1024
-#define KERN_SIZE 16000 //Max is 64 KB
+// two potential tile_width values depending on input size
+#define TILE_WIDTH_SMALL 16
+#define TILE_WIDTH_BIG 24
 
 #include <mxnet/base.h>
 
@@ -12,77 +12,141 @@ namespace mxnet
 namespace op
 {
 
+// Combied unroll and matrix multiplication kernel
+__global__ void matrix_multiply_small(const float *x, const float *w, float *y, 
+                                int M, int C, int H, int W, int K) {
 
-// Calls unroll kernel from the host
-// void unroll_x(float* x_unroll, int total, float* x, int C, int H, int W, int K, int b){
-//     // H, C, W -> H, (C x W)
-//     int H_out = H - K + 1;
-//     int W_out = W - K + 1;
-//
-//     dim3 gridDim(ceil(C * H_out * W_out*1.0 / TILE_WIDTH), 1, 1);
-//     dim3 blockDim(TILE_WIDTH, 1, 1);
-//     unroll_x_kernel<<<gridDim, blockDim>>>(C, H, W, K, b, x, x_unroll);
-// }
-
-//All these parameters are needed for the #define macro :(
-__global__ void unroll_x_kernel(int C, int H, int W, int K, float* x_unroll, int total, float *X){
-
-
-    int c, s;
-    int tx = blockIdx.x*blockDim.x + threadIdx.x;
-
-    int H_out = H - K + 1;
-    int W_out = W - K + 1;
-    int W_unroll = H_out * W_out;
-
-    int stride = blockDim.x * gridDim.x;
-    while (tx < total){
-        c = tx / W_unroll;  //row
-        s = tx % W_unroll;  //col
-
-        int i = c % K;
-        c /= K; //come back to this
-        int j = c % K;
-        int k = c / K;
-        int col_out = s % W_out;
-        int col_out2 = s/W_out;
-
-        x_unroll[tx] = X[k*H*W + (col_out2 + j) * W + (col_out + i)];
-        tx+= stride;
-    }
-}
-
-__constant__ float Const_Kernel[KERN_SIZE];
-
-__global__ void matrix_multiply(float *w, float *x, float *y, int W_unroll, int M, int H_unroll){
-
-    __shared__ float tile2[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float tile1[TILE_WIDTH_SMALL][TILE_WIDTH_SMALL];
+    __shared__ float tile2[TILE_WIDTH_SMALL][TILE_WIDTH_SMALL];
 
     int row = blockIdx.y*blockDim.y+threadIdx.y;
     int col = blockIdx.x*blockDim.x+threadIdx.x;
 
     float Y_val = 0;
 
-    for(int i = 0; i < ceil(1.0*W_unroll/TILE_WIDTH); i++){
-        tile2[threadIdx.y][threadIdx.x] = 0;
+    //for unrolling
 
-        int row_idx = i*TILE_WIDTH+threadIdx.y;
+    const int H_out = H - K + 1;
+    const int W_out = W - K + 1;
+    const int X_col = C * K * K;
+    const int Y_col = H_out * W_out;
+    int unroll_w, unroll_p, unroll_c, unroll_q, unroll_h;
 
-        if(row_idx < W_unroll){
-         tile2[threadIdx.x][threadIdx.y] = x[row_idx*H_unroll + col];
+    //take advantage of parallelism
+    x += blockIdx.z*C*H*W;
+    y += blockIdx.z*M*Y_col;
+
+    for(int i = 0; i < ceil(1.0*X_col/TILE_WIDTH_SMALL); i++) {
+        int col_idx = i*TILE_WIDTH_SMALL + threadIdx.x;
+
+        if(col_idx < X_col){
+          //load tile
+            tile1[threadIdx.y][threadIdx.x] = w[row*X_col+col_idx];
+        } else {
+          tile1[threadIdx.y][threadIdx.x] = 0;
         }
+        //ignore otherwise
+
+
+        int row_idx = i*TILE_WIDTH_SMALL+threadIdx.y;
+
+        if(row_idx < X_col){
+
+          //begin unroll
+         // unroll_row = (row_idx * Y_col + col) / Y_col;
+         // unroll_col = (row_idx * Y_col + col) % Y_col;
+
+         unroll_q = ((row_idx * Y_col + col) / Y_col) % K;
+         unroll_p = (((row_idx * Y_col + col) / Y_col) / K) % K;
+         unroll_c = (((row_idx * Y_col + col) / Y_col) / K) / K;
+         unroll_w = ((row_idx * Y_col + col) % Y_col) % W_out;
+         unroll_h = ((row_idx * Y_col + col) % Y_col) / W_out;
+         //load second tile
+         tile2[threadIdx.y][threadIdx.x] = x[unroll_c * H * W + (unroll_h + unroll_p) * W + (unroll_w + unroll_q)];
+       } else {
+         //nothing since we inited tiles to 0
+         tile2[threadIdx.y][threadIdx.x] = 0;
+       }
         __syncthreads();
-        for(int j = 0; j < TILE_WIDTH; j++){
-                Y_val += Const_Kernel[row*W_unroll + i*TILE_WIDTH+j] * tile2[threadIdx.x][j];
+
+        for(int j = 0; j < TILE_WIDTH_SMALL; j++) {
+            Y_val += tile1[threadIdx.y][j] * tile2[j][threadIdx.x];
         }
         __syncthreads();
     }
 
-    if(row < M && col < H_unroll){
-          y[row*H_unroll+col] = Y_val;
-     }
+    if(row < M && col < Y_col) {
+        y[row * Y_col + col] = Y_val;
+    }
 }
 
+// This is the exact same as the above code except the TILE_WIDTH is different
+// Needs to be different kernel because shared mem initialization needs const values
+__global__ void matrix_multiply_big(const float *x, const float *w, float *y, 
+                                int M, int C, int H, int W, int K) {
+
+    __shared__ float tile1[TILE_WIDTH_BIG][TILE_WIDTH_BIG];
+    __shared__ float tile2[TILE_WIDTH_BIG][TILE_WIDTH_BIG];
+
+    int row = blockIdx.y*blockDim.y+threadIdx.y;
+    int col = blockIdx.x*blockDim.x+threadIdx.x;
+
+    float Y_val = 0;
+
+    //for unrolling
+
+    const int H_out = H - K + 1;
+    const int W_out = W - K + 1;
+    const int X_col = C * K * K;
+    const int Y_col = H_out * W_out;
+    int unroll_w, unroll_p, unroll_c, unroll_q, unroll_h;
+    
+    //take advantage of parallelism
+    x += blockIdx.z*C*H*W;
+    y += blockIdx.z*M*Y_col;
+
+    for(int i = 0; i < ceil(1.0*X_col/TILE_WIDTH_BIG); i++) {
+        int col_idx = i*TILE_WIDTH_BIG + threadIdx.x;
+
+        if(col_idx < X_col){
+          //load tile
+            tile1[threadIdx.y][threadIdx.x] = w[row*X_col+col_idx];
+        } else {
+          tile1[threadIdx.y][threadIdx.x] = 0;
+        }
+        //ignore otherwise
+
+        int row_idx = i*TILE_WIDTH_BIG+threadIdx.y;
+
+        if(row_idx < X_col){
+
+          //begin unroll
+         // unroll_row = (row_idx * Y_col + col) / Y_col;
+         // unroll_col = (row_idx * Y_col + col) % Y_col;
+
+         unroll_q = ((row_idx * Y_col + col) / Y_col) % K;
+         unroll_p = (((row_idx * Y_col + col) / Y_col) / K) % K;
+         unroll_c = (((row_idx * Y_col + col) / Y_col) / K) / K;
+         unroll_w = ((row_idx * Y_col + col) % Y_col) % W_out;
+         unroll_h = ((row_idx * Y_col + col) % Y_col) / W_out;
+         //load second tile
+         tile2[threadIdx.y][threadIdx.x] = x[unroll_c * H * W + (unroll_h + unroll_p) * W + (unroll_w + unroll_q)];
+       } else {
+         //nothing since we inited tiles to 0
+         tile2[threadIdx.y][threadIdx.x] = 0;
+       }
+        __syncthreads();
+
+        for(int j = 0; j < TILE_WIDTH_BIG; j++) {
+            Y_val += tile1[threadIdx.y][j] * tile2[j][threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    if(row < M && col < Y_col) {
+        y[row * Y_col + col] = Y_val;
+    }
+}
 
 /*
    This function is called by new-inl.h
@@ -100,7 +164,7 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y,
     // x -> C * K * K * (H_out * W_out)
 
 
-    // Extract the tensor dimensions into B,M,C,H,W,K
+    // Extract the tensor sions into B,M,C,H,W,K
     const int B = x.shape_[0]; //Number of elements in batch
     const int M = y.shape_[1]; //Number of output feature maps
     const int C = x.shape_[1]; //Number of input feature maps
@@ -110,36 +174,24 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y,
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
 
-    const int W_unroll = C * K * K;
-    const int H_unroll = H_out * W_out;
-
-    float* x_unrolled;
-    // float* w_unrolled;
-
-    float* w_host = (float*)malloc(M*W_unroll*sizeof(float));
-    cudaMemcpy(w_host, w.dptr_, M*W_unroll*sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpyToSymbol(Const_Kernel, w_host, M*W_unroll*sizeof(float));
-
-    int dimension = C*H*W;
-    int total = W_unroll*H_unroll;
-    cudaMalloc(&x_unrolled, total * sizeof(float));
-
-    // Only have to unroll w once because it's the same for all batches
-    // unroll_w(C, K, M, w.dptr_, w_unrolled);
-
-    // loop thru all batch elements
-    for (int b = B; b--; ){
-        int grid = ceil(total*1.0/BLOCK_SIZE);
-        unroll_x_kernel<<<grid, BLOCK_SIZE>>>(C, H, W, K, x_unrolled, total, b*dimension + x.dptr_);
-
-        dim3 gridDim (ceil(H_unroll*1.0/TILE_WIDTH), ceil(M*1.0/TILE_WIDTH));
-        dim3 blockDim(TILE_WIDTH, TILE_WIDTH);
-        matrix_multiply<<<gridDim, blockDim>>>(w.dptr_, x_unrolled, y.dptr_+b*M*H_unroll, W_unroll, M, H_unroll);
+    // Different tile widths run quicker depending on the size of the 
+    // input, so adjust depending on if the data is "big" or "small"
+    float * X = x.dptr_;
+    float * W_ptr = w.dptr_;
+    float * Y = y.dptr_;
+    if (M > 4 && C > 6){
+        dim3 gridDim(ceil(H_out*W_out*1.0/TILE_WIDTH_BIG), ceil(M*1.0/TILE_WIDTH_BIG), B);
+        dim3 blockDim(TILE_WIDTH_BIG, TILE_WIDTH_BIG, 1);
+        matrix_multiply_big<<<gridDim, blockDim>>>(X, W_ptr, Y, M, C, H, W, K);
+    }
+    else{
+        dim3 gridDim(ceil(H_out*W_out*1.0/TILE_WIDTH_SMALL), ceil(M*1.0/TILE_WIDTH_SMALL), B);
+        dim3 blockDim(TILE_WIDTH_SMALL, TILE_WIDTH_SMALL, 1);
+        matrix_multiply_small<<<gridDim, blockDim>>>(X, W_ptr, Y, M, C, H, W, K);
     }
 
     //free allocated memory
-    cudaFree(x_unrolled);
-    free(w_host);
+    //cudaFree(x_unrolled);
 
     // Use MSHADOW_CUDA_CALL to check for CUDA runtime errors.
     MSHADOW_CUDA_CALL(cudaDeviceSynchronize());

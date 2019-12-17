@@ -1,7 +1,7 @@
 #ifndef MXNET_OPERATOR_NEW_FORWARD_CUH_
 #define MXNET_OPERATOR_NEW_FORWARD_CUH_
 
-#define TILE_WIDTH 4
+#define TILE_WIDTH 16
 #define BLOCK_SIZE 1024
 
 #include <mxnet/base.h>
@@ -11,7 +11,7 @@ namespace mxnet
 namespace op
 {
 
-__global__ void matrix_multiply(float *x, float *w, float *y, int M, int C, int H, int W, int K) {
+__global__ void matrix_multiply(const float *x, const float *w, float *y, int M, int C, int H, int W, int K) {
 
     __shared__ float tile1[TILE_WIDTH][TILE_WIDTH];
     __shared__ float tile2[TILE_WIDTH][TILE_WIDTH];
@@ -23,18 +23,15 @@ __global__ void matrix_multiply(float *x, float *w, float *y, int M, int C, int 
 
     //for unrolling
 
-    int H_out = H - K + 1;
-    int W_out = W - K + 1;
-    int X_col = C * K * K;
-    int Y_col = H_out * W_out;
-    int idx, unroll_w, unroll_p, unroll_c, unroll_q, unroll_h, unroll_row, unroll_col;
+    const int H_out = H - K + 1;
+    const int W_out = W - K + 1;
+    const int X_col = C * K * K;
+    const int Y_col = H_out * W_out;
+    int unroll_w, unroll_p, unroll_c, unroll_q, unroll_h, unroll_row, unroll_col;
 
 
     for(int i = 0; i < ceil(1.0*X_col/TILE_WIDTH); i++) {
         int col_idx = i*TILE_WIDTH + threadIdx.x;
-        //init tile (could probably remove later)
-        //tile1[threadIdx.y][threadIdx.x] = 0;
-        //tile2[threadIdx.y][threadIdx.x] = 0;
 
         // Load tile 1 - w
         if(col_idx < X_col){
@@ -49,14 +46,12 @@ __global__ void matrix_multiply(float *x, float *w, float *y, int M, int C, int 
 
         // Load tile 2 - x
         if(row_idx < X_col){
-          //begin unroll
-            idx = row_idx * Y_col + col;
-            unroll_row = idx / Y_col;
-            unroll_col = idx % Y_col;
+            //begin unroll
+            unroll_row = (row_idx * Y_col + col) / Y_col;
+            unroll_col = (row_idx * Y_col + col) % Y_col;
             unroll_q = unroll_row % K;
-            unroll_row = unroll_row / K;
-            unroll_p = unroll_row % K;
-            unroll_c = unroll_row / K;
+            unroll_p = (unroll_row / K) % K;
+            unroll_c = (unroll_row / K) / K;
             unroll_w = unroll_col % W_out;
             unroll_h = unroll_col / W_out;
             //load second tile
@@ -105,8 +100,6 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y,
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
 
-
-    printf("M = %d, C = %d, K = %d\n", M, C, K);
     // loop thru all batch elements
     for (int b = B; b--; ){
         

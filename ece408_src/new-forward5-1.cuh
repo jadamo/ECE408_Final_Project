@@ -1,7 +1,7 @@
 #ifndef MXNET_OPERATOR_NEW_FORWARD_CUH_
 #define MXNET_OPERATOR_NEW_FORWARD_CUH_
 
-#define TILE_WIDTH 32
+#define TILE_WIDTH 16
 #define BLOCK_SIZE 1024
 #define KERN_SIZE 16000 //Max is 64 KB
 
@@ -13,27 +13,15 @@ namespace op
 {
 
 
-// Calls unroll kernel from the host
-// void unroll_x(float* x_unroll, int total, float* x, int C, int H, int W, int K, int b){
-//     // H, C, W -> H, (C x W)
-//     int H_out = H - K + 1;
-//     int W_out = W - K + 1;
-//
-//     dim3 gridDim(ceil(C * H_out * W_out*1.0 / TILE_WIDTH), 1, 1);
-//     dim3 blockDim(TILE_WIDTH, 1, 1);
-//     unroll_x_kernel<<<gridDim, blockDim>>>(C, H, W, K, b, x, x_unroll);
-// }
-
 //All these parameters are needed for the #define macro :(
-__global__ void unroll_x_kernel(int C, int H, int W, int K, float* x_unroll, int total, float *X){
-
+__global__ void unroll_x_kernel(int C, int H, int W, int K, float* x_unroll, int total, const float *X){
 
     int c, s;
     int tx = blockIdx.x*blockDim.x + threadIdx.x;
 
-    int H_out = H - K + 1;
-    int W_out = W - K + 1;
-    int W_unroll = H_out * W_out;
+    const int H_out = H - K + 1;
+    const int W_out = W - K + 1;
+    const int W_unroll = H_out * W_out;
 
     int stride = blockDim.x * gridDim.x;
     while (tx < total){
@@ -54,8 +42,9 @@ __global__ void unroll_x_kernel(int C, int H, int W, int K, float* x_unroll, int
 
 __constant__ float Const_Kernel[KERN_SIZE];
 
-__global__ void matrix_multiply(float *w, float *x, float *y, int W_unroll, int M, int H_unroll){
+__global__ void matrix_multiply(const float *x, float *y, int W_unroll, int M, int H_unroll){
 
+    __shared__ float tile1[TILE_WIDTH][TILE_WIDTH];
     __shared__ float tile2[TILE_WIDTH][TILE_WIDTH];
 
     int row = blockIdx.y*blockDim.y+threadIdx.y;
@@ -64,16 +53,29 @@ __global__ void matrix_multiply(float *w, float *x, float *y, int W_unroll, int 
     float Y_val = 0;
 
     for(int i = 0; i < ceil(1.0*W_unroll/TILE_WIDTH); i++){
-        tile2[threadIdx.y][threadIdx.x] = 0;
-
+        int col_idx = i*TILE_WIDTH + threadIdx.x;
         int row_idx = i*TILE_WIDTH+threadIdx.y;
 
+        // Load tiles
+        // For some reason loading const into shared mem is faster...
+        if(col_idx < W_unroll){
+            tile1[threadIdx.y][threadIdx.x] = x[row*W_unroll+col_idx];
+        }
+        else{
+            tile1[threadIdx.y][threadIdx.x] = 0.0;
+        }
+
         if(row_idx < W_unroll){
-         tile2[threadIdx.x][threadIdx.y] = x[row_idx*H_unroll + col];
+            tile2[threadIdx.y][threadIdx.x] = Const_Kernel[row_idx*H_unroll + col];
+        }
+        else{
+            tile2[threadIdx.y][threadIdx.x] = 0.0;
         }
         __syncthreads();
+
+        // do summation for this tile
         for(int j = 0; j < TILE_WIDTH; j++){
-                Y_val += Const_Kernel[row*W_unroll + i*TILE_WIDTH+j] * tile2[threadIdx.x][j];
+            Y_val += tile1[threadIdx.y][j] * tile2[j][threadIdx.x];
         }
         __syncthreads();
     }
@@ -97,7 +99,7 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y,
 
     // Use mxnet's CHECK_EQ to do assertions.
     // w -> M x (C x K x K)
-    // x -> C * K * K * (H_out * W_out)
+    // x -> C * K * K * (H_out * W_out
 
 
     // Extract the tensor dimensions into B,M,C,H,W,K
@@ -116,9 +118,7 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y,
     float* x_unrolled;
     // float* w_unrolled;
 
-    float* w_host = (float*)malloc(M*W_unroll*sizeof(float));
-    cudaMemcpy(w_host, w.dptr_, M*W_unroll*sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpyToSymbol(Const_Kernel, w_host, M*W_unroll*sizeof(float));
+    cudaMemcpyToSymbol(Const_Kernel, w.dptr_, M*W_unroll*sizeof(float));
 
     int dimension = C*H*W;
     int total = W_unroll*H_unroll;
@@ -134,12 +134,11 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y,
 
         dim3 gridDim (ceil(H_unroll*1.0/TILE_WIDTH), ceil(M*1.0/TILE_WIDTH));
         dim3 blockDim(TILE_WIDTH, TILE_WIDTH);
-        matrix_multiply<<<gridDim, blockDim>>>(w.dptr_, x_unrolled, y.dptr_+b*M*H_unroll, W_unroll, M, H_unroll);
+        matrix_multiply<<<gridDim, blockDim>>>(x_unrolled, y.dptr_+b*M*H_unroll, W_unroll, M, H_unroll);
     }
 
     //free allocated memory
     cudaFree(x_unrolled);
-    free(w_host);
 
     // Use MSHADOW_CUDA_CALL to check for CUDA runtime errors.
     MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
